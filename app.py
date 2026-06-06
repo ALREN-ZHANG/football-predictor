@@ -354,13 +354,14 @@ def process_dataframe(df):
             odds_home = 1.0 / (raw_home / total_raw)
             odds_draw = 1.0 / (raw_draw / total_raw)
             odds_away = 1.0 / (raw_away / total_raw)
+            home_p = raw_home / total_raw
+            draw_p = raw_draw / total_raw
+            away_p = raw_away / total_raw
         else:
             odds_home = odds_draw = odds_away = 0.0
-        home_p = raw_home / total_raw if total_raw>0 else 0
-        draw_p = raw_draw / total_raw if total_raw>0 else 0
-        away_p = raw_away / total_raw if total_raw>0 else 0
-        min_bt = min(odds.items(), key=lambda x: x[1])[0]
-        max_p = 1.0/odds[min_bt]/total_raw if total_raw>0 else 0
+            home_p = draw_p = away_p = 0.0
+        min_bt = min(odds.items(), key=lambda x: x[1])[0] if odds else "未知"
+        max_p = 1.0/odds[min_bt]/total_raw if total_raw>0 and min_bt in odds else 0
         home_first = home_p + 0.5*draw_p
         away_first = away_p + 0.5*draw_p
         company = row[company_col] if company_col in row else f"行{idx+1}"
@@ -1048,7 +1049,7 @@ def train_models():
     save_scaler(scaler_ou, SCALER_OU)
     
     # 使用最近20%的数据作为独立验证集（不参与交叉验证，仅用于最终评估）
-    n_test = max(10, int(len(X)*0.5))
+    n_test = max(10, int(len(X)*0.2))
     n_test = min(n_test, len(X))
     X_test = X_scaled[-n_test:]
     y_asian_test = y_asian[-n_test:]
@@ -1209,8 +1210,8 @@ def asian_handicap_stat(similar_matches, target_hc):
         actual_hc = m.get('实际盘口')
         if pd.isna(actual_hc):
             continue
-        # 由于盘口精度可能为0.25，直接比较浮点数有风险，使用四舍五入到0.05后比较
-        if abs(actual_hc - target_hc) < 0.05:
+        # 四舍五入到小数点后2位比较，避免浮点精度问题
+        if round(actual_hc, 2) == round(target_hc, 2):
             cnt += 1
             try:
                 h, a = map(int, m['比分'].split(':'))
@@ -1334,7 +1335,6 @@ def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_l
     cnt, win_rate, is_home_team = asian_handicap_stat(similar_matches, asian_hc)
     
     # 智能调整：根据赢盘率决定推荐方向
-    original_hc = asian_hc
     if cnt >= 5:
         # 赢盘率低于40% -> 反转推荐（推荐受让方）
         if win_rate < 0.4:
@@ -1611,110 +1611,151 @@ with tab1:
                                                   lam_h_init=lam_h_init, lam_a_init=lam_a_init)
             st.session_state['similar_for_rec'] = similar_matches
             
-            # ========== 球队近期真实实力 & 综合推荐（折叠区域） ==========
-            with st.expander("📊 球队近期真实实力 & 综合推荐 (与本场解析的比赛对比)"):
-                st.markdown("**说明**：以下推荐基于当前解析的本场比赛波胆赔率。")
-                st.info(f"**当前解析的本场比赛市场λ**：主队 {lam_h_live:.3f} | 客队 {lam_a_live:.3f}")
-                col_team1, col_team2 = st.columns(2)
-                with col_team1:
-                    team_h = st.text_input("主队名称", key="strength_h")
-                with col_team2:
-                    team_a = st.text_input("客队名称", key="strength_a")
-                use_ml = st.checkbox("使用机器学习模型（随机森林）", value=False, key="use_ml")
-                if use_ml:
-                    st.caption("机器学习模型需要至少50场有效历史比赛才能训练，如未训练请先点击下方按钮训练。")
-                st.markdown("---")
-                if st.button("🎯 生成综合推荐（基于以上队名）", key="comp_rec_inside"):
-                    if team_h and team_a:
-                        with st.spinner("分析中..."):
-                            avg_raw_h, avg_adj_h, details_h, cnt_h = get_team_recent_strength(team_h, n_matches=5, apply_result_adjust=True)
-                            avg_raw_a, avg_adj_a, details_a, cnt_a = get_team_recent_strength(team_a, n_matches=5, apply_result_adjust=True)
-                            st.session_state['strength_h_raw'] = avg_raw_h
-                            st.session_state['strength_h_adj'] = avg_adj_h
-                            st.session_state['strength_h_details'] = details_h
-                            st.session_state['strength_a_raw'] = avg_raw_a
-                            st.session_state['strength_a_adj'] = avg_adj_a
-                            st.session_state['strength_a_details'] = details_a
-                            (combined_odds, strength_odds, market_odds, asian_rec, final_ou, ou_conf, pred_score, pred_note) = comprehensive_recommendation(
-                                team_h, team_a,
-                                lam_h_init, lam_a_init,
-                                lam_h_live, lam_a_live,
-                                similar_matches,
-                                real_h_lam=avg_adj_h,
-                                real_a_lam=avg_adj_a,
-                                use_ml=use_ml
-                            )
-                            st.markdown("### 📌 综合推荐结果")
-                            
-                            # 亚洲盘推荐
-                            st.markdown("#### 🎲 亚洲盘推荐")
-                            st.write(asian_rec)
-                            
-                            # 三个赔率
-                            st.markdown("#### 📊 胜平负赔率（返还率90%）")
-                            col_combined, col_strength, col_market = st.columns(3)
-                            with col_combined:
-                                st.markdown("**综合推荐赔率**（加权λ模型）")
-                                st.write(f"主胜: {combined_odds[0]:.2f}")
-                                st.write(f"平局: {combined_odds[1]:.2f}")
-                                st.write(f"客胜: {combined_odds[2]:.2f}")
-                            with col_strength:
-                                st.markdown("**硬实力赔率**（近5场调整后λ）")
-                                st.write(f"主胜: {strength_odds[0]:.2f}")
-                                st.write(f"平局: {strength_odds[1]:.2f}")
-                                st.write(f"客胜: {strength_odds[2]:.2f}")
-                            with col_market:
-                                st.markdown("**市场赔率**（波胆隐含λ）")
-                                st.write(f"主胜: {market_odds[0]:.2f}")
-                                st.write(f"平局: {market_odds[1]:.2f}")
-                                st.write(f"客胜: {market_odds[2]:.2f}")
-                            
-                            # 大小球与比分
-                            st.markdown("#### ⚽ 大小球与比分")
-                            st.write(f"大小球推荐: {final_ou} (置信度 {ou_conf:.0%})")
-                            st.write(f"预测比分: {pred_score} {pred_note}")
-                            
-                            if avg_adj_h is not None and avg_adj_a is not None:
-                                st.markdown("**📊 硬实力摘要**")
-                                st.write(f"主队 {team_h} 修正后 λ: {avg_adj_h:.3f} | 客队 {team_a} 修正后 λ: {avg_adj_a:.3f}")
-                            else:
-                                st.info("主队或客队历史数据不足（少于5场有效比赛），无法计算硬实力。")
-                            st.caption("注：综合推荐仅供参考，请结合实时市场变化谨慎决策。")
-                            if use_ml:
-                                st.caption("大小球推荐基于机器学习模型（随机森林）生成。")
-                            else:
-                                st.caption("大小球推荐权重：相似历史比赛40% | 赔率变化30% | 历史交锋20% | 球队硬实力10%")
-                    else:
-                        st.warning("请填写主队和客队名称")
-                # 显示已查询的硬实力详情
-                if st.session_state.get('strength_h_adj') is not None:
-                    st.markdown("---")
-                    st.markdown("**📊 已查询的硬实力结果**")
-                    col_h, col_a = st.columns(2)
-                    with col_h:
-                        st.write(f"**主队 {team_h}**")
-                        val_h = st.session_state.get('strength_h_adj')
-                        if val_h is not None:
-                            st.write(f"修正后 λ: {val_h:.3f}")
+            # ========== 球队近期真实实力 & 波胆对比（始终可见） ==========
+            st.markdown("## 📊 球队近期真实实力 & 综合推荐")
+            st.markdown("**说明**：以下推荐基于当前解析的本场比赛波胆赔率。")
+            st.info(f"**当前解析的本场比赛市场λ**：主队 {lam_h_live:.3f} | 客队 {lam_a_live:.3f}")
+            
+            col_team1, col_team2 = st.columns(2)
+            with col_team1:
+                team_h = st.text_input("主队名称", key="strength_h")
+            with col_team2:
+                team_a = st.text_input("客队名称", key="strength_a")
+            
+            use_ml = st.checkbox("使用机器学习模型（随机森林）", value=False, key="use_ml")
+            if use_ml:
+                st.caption("机器学习模型需要至少50场有效历史比赛才能训练，如未训练请先点击下方按钮训练。")
+            st.markdown("---")
+            if st.button("🎯 生成综合推荐（基于以上队名）", key="comp_rec_inside"):
+                if team_h and team_a:
+                    with st.spinner("分析中..."):
+                        avg_raw_h, avg_adj_h, details_h, cnt_h = get_team_recent_strength(team_h, n_matches=5, apply_result_adjust=True)
+                        avg_raw_a, avg_adj_a, details_a, cnt_a = get_team_recent_strength(team_a, n_matches=5, apply_result_adjust=True)
+                        st.session_state['strength_h_raw'] = avg_raw_h
+                        st.session_state['strength_h_adj'] = avg_adj_h
+                        st.session_state['strength_h_details'] = details_h
+                        st.session_state['strength_a_raw'] = avg_raw_a
+                        st.session_state['strength_a_adj'] = avg_adj_a
+                        st.session_state['strength_a_details'] = details_a
+                        (combined_odds, strength_odds, market_odds, asian_rec, final_ou, ou_conf, pred_score, pred_note) = comprehensive_recommendation(
+                            team_h, team_a,
+                            lam_h_init, lam_a_init,
+                            lam_h_live, lam_a_live,
+                            similar_matches,
+                            real_h_lam=avg_adj_h,
+                            real_a_lam=avg_adj_a,
+                            use_ml=use_ml
+                        )
+                        st.markdown("### 📌 综合推荐结果")
+                        
+                        # 亚洲盘推荐
+                        st.markdown("#### 🎲 亚洲盘推荐")
+                        st.write(asian_rec)
+                        
+                        # 三个赔率
+                        st.markdown("#### 📊 胜平负赔率（返还率90%）")
+                        col_combined, col_strength, col_market = st.columns(3)
+                        with col_combined:
+                            st.markdown("**综合推荐赔率**（加权λ模型）")
+                            st.write(f"主胜: {combined_odds[0]:.2f}")
+                            st.write(f"平局: {combined_odds[1]:.2f}")
+                            st.write(f"客胜: {combined_odds[2]:.2f}")
+                        with col_strength:
+                            st.markdown("**硬实力赔率**（近5场调整后λ）")
+                            st.write(f"主胜: {strength_odds[0]:.2f}")
+                            st.write(f"平局: {strength_odds[1]:.2f}")
+                            st.write(f"客胜: {strength_odds[2]:.2f}")
+                        with col_market:
+                            st.markdown("**市场赔率**（波胆隐含λ）")
+                            st.write(f"主胜: {market_odds[0]:.2f}")
+                            st.write(f"平局: {market_odds[1]:.2f}")
+                            st.write(f"客胜: {market_odds[2]:.2f}")
+                        
+                        # 大小球与比分
+                        st.markdown("#### ⚽ 大小球与比分")
+                        st.write(f"大小球推荐: {final_ou} (置信度 {ou_conf:.0%})")
+                        st.write(f"预测比分: {pred_score} {pred_note}")
+                        
+                        if avg_adj_h is not None and avg_adj_a is not None:
+                            st.markdown("**📊 硬实力摘要**")
+                            st.write(f"主队 {team_h} 修正后 λ: {avg_adj_h:.3f} | 客队 {team_a} 修正后 λ: {avg_adj_a:.3f}")
                         else:
-                            st.write("修正后 λ: 暂无数据")
-                        details_h = st.session_state.get('strength_h_details', [])
-                        if details_h:
-                            with st.expander(f"查看最近 {len(details_h)} 场详情"):
-                                st.dataframe(pd.DataFrame(details_h), use_container_width=True)
-                    with col_a:
-                        st.write(f"**客队 {team_a}**")
-                        val_a = st.session_state.get('strength_a_adj')
-                        if val_a is not None:
-                            st.write(f"修正后 λ: {val_a:.3f}")
+                            st.info("主队或客队历史数据不足（少于5场有效比赛），无法计算硬实力。")
+                        st.caption("注：综合推荐仅供参考，请结合实时市场变化谨慎决策。")
+                        if use_ml:
+                            st.caption("推荐基于机器学习模型（随机森林）生成。")
                         else:
-                            st.write("修正后 λ: 暂无数据")
-                        details_a = st.session_state.get('strength_a_details', [])
-                        if details_a:
-                            with st.expander(f"查看最近 {len(details_a)} 场详情"):
-                                st.dataframe(pd.DataFrame(details_a), use_container_width=True)
+                            st.caption("推荐权重：相似历史比赛40% | 赔率变化30% | 历史交锋20% | 球队硬实力10%")
                 else:
-                    st.info("点击上方按钮生成综合推荐后，此处将显示球队硬实力详情。")
+                    st.warning("请填写主队和客队名称")
+            
+            if st.session_state.get('strength_h_adj') is not None:
+                st.markdown("---")
+                st.markdown("**📊 已查询的硬实力结果**")
+                col_h, col_a = st.columns(2)
+                with col_h:
+                    st.write(f"**主队 {team_h}**")
+                    val_h = st.session_state.get('strength_h_adj')
+                    if val_h is not None:
+                        st.write(f"修正后 λ: {val_h:.3f}")
+                    else:
+                        st.write("修正后 λ: 暂无数据")
+                    details_h = st.session_state.get('strength_h_details', [])
+                    if details_h:
+                        with st.expander(f"查看最近 {len(details_h)} 场详情"):
+                            st.dataframe(pd.DataFrame(details_h), use_container_width=True)
+                with col_a:
+                    st.write(f"**客队 {team_a}**")
+                    val_a = st.session_state.get('strength_a_adj')
+                    if val_a is not None:
+                        st.write(f"修正后 λ: {val_a:.3f}")
+                    else:
+                        st.write("修正后 λ: 暂无数据")
+                    details_a = st.session_state.get('strength_a_details', [])
+                    if details_a:
+                        with st.expander(f"查看最近 {len(details_a)} 场详情"):
+                            st.dataframe(pd.DataFrame(details_a), use_container_width=True)
+            else:
+                st.info("点击上方按钮生成综合推荐后，此处将显示球队硬实力详情。")
+            
+            st.markdown("---")
+            st.markdown("#### 🆚 硬实力 vs 本场市场波胆对比")
+            cur_lam_h = st.session_state.get('lam_h_live', None)
+            cur_lam_a = st.session_state.get('lam_a_live', None)
+            real_h_lam = st.session_state.get('strength_h_adj', None)
+            real_a_lam = st.session_state.get('strength_a_adj', None)
+            if cur_lam_h is None or cur_lam_a is None:
+                st.info("请先在「波胆赔率分析」中解析本场比赛。")
+            elif real_h_lam is None or real_a_lam is None:
+                st.info("请先点击上方「生成综合推荐」按钮获取球队硬实力。")
+            else:
+                # 硬实力得分：主队加成0.2，客队加成0.1
+                home_strength_score = (real_h_lam - real_a_lam) * 0.8 + 0.2
+                away_strength_score = (real_a_lam - real_h_lam) * 0.8 + 0.1
+                market_score = cur_lam_h - cur_lam_a
+                
+                st.subheader("📊 硬实力得分 vs 市场预期得分")
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    st.metric("主队硬实力得分", f"{home_strength_score:+.3f}", 
+                              delta=f"vs 市场 {market_score:+.3f}" if market_score is not None else None)
+                    st.caption("计算方式：(主队近5场λ - 客队近5场λ) × 0.8 + 主场加成(0.2)")
+                with col_s2:
+                    st.metric("客队硬实力得分", f"{away_strength_score:+.3f}",
+                              delta=f"vs 市场 {-market_score:+.3f}" if market_score is not None else None)
+                    st.caption("计算方式：(客队近5场λ - 主队近5场λ) × 0.8 + 客场加成(0.1)")
+                
+                st.markdown("**💡 分析结论**")
+                diff_strength = home_strength_score - away_strength_score
+                diff_market = market_score
+                if diff_strength > diff_market + 0.2:
+                    st.warning(f"主队硬实力得分 ({diff_strength:+.2f}) 明显高于市场预期 ({diff_market:+.2f})，市场可能低估主队。")
+                elif diff_strength < diff_market - 0.2:
+                    st.info(f"主队硬实力得分 ({diff_strength:+.2f}) 明显低于市场预期 ({diff_market:+.2f})，市场可能高估主队。")
+                else:
+                    st.success(f"主队硬实力与市场预期基本一致（差值 {diff_strength - diff_market:+.2f})")
+                
+                st.caption(f"注：主队近5场平均λ = {real_h_lam:.3f}，客队近5场平均λ = {real_a_lam:.3f}；市场主队λ = {cur_lam_h:.3f}，市场客队λ = {cur_lam_a:.3f}")
             
             # ========== 机器学习模型训练按钮 ==========
             st.markdown("### 🤖 机器学习模型训练")
