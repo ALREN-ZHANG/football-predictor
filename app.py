@@ -1093,7 +1093,6 @@ def predict_with_ml(row, df_history):
     prob_asian = rf_asian.predict_proba(features_scaled_asian)[0]  # [输,走,赢]
     prob_ou = rf_ou.predict_proba(features_scaled_ou)[0][1]        # 大球概率
     return prob_asian, prob_ou
-
 # ========== 综合推荐函数（返回三个赔率组 + 亚盘推荐 + 统计百分比，并智能调整方向） ==========
 def get_head_to_head(team_h, team_a):
     df = load_results()
@@ -1198,10 +1197,6 @@ def odds_change_recommendation(lam_h_init, lam_h_live, lam_a_init, lam_a_live):
     return hc_change, ou_tend
 
 def asian_handicap_stat(similar_matches, target_hc):
-    """
-    统计相似比赛中实际盘口等于 target_hc 的场次中，让球方（主队或客队）的赢盘率
-    返回 (count, win_rate, is_home_team)
-    """
     if not similar_matches or len(similar_matches) < 6:
         return 0, None, None
     cnt = 0
@@ -1210,42 +1205,29 @@ def asian_handicap_stat(similar_matches, target_hc):
         actual_hc = m.get('实际盘口')
         if pd.isna(actual_hc):
             continue
-        # 四舍五入到小数点后2位比较，避免浮点精度问题
         if round(actual_hc, 2) == round(target_hc, 2):
             cnt += 1
             try:
                 h, a = map(int, m['比分'].split(':'))
                 net = h - a
                 if actual_hc > 0:
-                    # 主队让球，主队赢盘条件：净胜球 > actual_hc
                     if net > actual_hc:
                         win += 1
                 elif actual_hc < 0:
-                    # 客队让球，客队赢盘条件：主队净胜球 < actual_hc（即客队净胜 > -actual_hc）
                     if net < actual_hc:
                         win += 1
                 else:
-                    # 平手盘，主队赢盘条件：净胜球 > 0
                     if net > 0:
                         win += 1
             except:
                 continue
     if cnt == 0:
         return 0, None, None
-    # 返回赢盘方是主队还是客队（用于文本）
-    is_home_team = True if target_hc > 0 else (False if target_hc < 0 else True)  # 平手盘按主队统计
+    is_home_team = True if target_hc > 0 else (False if target_hc < 0 else True)
     return cnt, win / cnt, is_home_team
 
 def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_live, lam_a_live, similar_matches,
                                  real_h_lam=None, real_a_lam=None, use_ml=False):
-    """
-    返回：
-    - combined_odds: (主胜, 平, 客胜) 基于加权λ模型
-    - strength_odds: (主胜, 平, 客胜) 基于近5场调整后λ
-    - market_odds:  (主胜, 平, 客胜) 基于波胆隐含λ
-    - asian_rec: 亚洲盘推荐文本（含统计百分比，并根据赢盘率智能调整方向）
-    - final_ou, ou_conf, pred_score, pred_note
-    """
     # 1. 获取硬实力调整后λ（用于硬实力赔率）
     if real_h_lam is None or real_a_lam is None:
         _, real_h_lam, _, _ = get_team_recent_strength(team_h, n_matches=5, apply_result_adjust=True)
@@ -1301,8 +1283,99 @@ def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_l
                       lam_a_h2h * weights['h2h'] +
                       lam_a_similar * weights['similar']) / total_w
 
-    # 辅助函数：根据λ计算胜平负赔率（返还率0.9）
-    def probs_and_odds(lam_h, lam_a, juice=0.9):
+    # 基于λ差值查找历史相似比赛，并统计概率
+    df_history = load_results()
+    lambda_stats = None
+    if not df_history.empty:
+        hist_lam_diff = df_history['λ_主队即'] - df_history['λ_客队即']
+        curr_lam_diff = lam_h_combined - lam_a_combined
+        diff_abs = (hist_lam_diff - curr_lam_diff).abs()
+        top_n = min(30, len(df_history))
+        if top_n > 0:
+            idx_sorted = diff_abs.argsort()[:top_n]
+            similar_lambda = df_history.iloc[idx_sorted]
+            similar_lambda = similar_lambda[similar_lambda['比分'].str.match(r'\d+:\d+')]
+            if len(similar_lambda) >= 5:
+                total = len(similar_lambda)
+                home_wins = 0
+                draws = 0
+                away_wins = 0
+                home_win_handicap = 0
+                over_25 = 0
+                for _, row in similar_lambda.iterrows():
+                    try:
+                        h, a = map(int, row['比分'].split(':'))
+                        if h > a:
+                            home_wins += 1
+                        elif h == a:
+                            draws += 1
+                        else:
+                            away_wins += 1
+                        if h + a > 2.5:
+                            over_25 += 1
+                        actual_hc = row.get('实际盘口')
+                        if pd.notna(actual_hc):
+                            net = h - a
+                            if actual_hc > 0:
+                                if net > actual_hc:
+                                    home_win_handicap += 1
+                            elif actual_hc < 0:
+                                if net < actual_hc:
+                                    home_win_handicap += 1
+                            else:
+                                if net > 0:
+                                    home_win_handicap += 1
+                    except:
+                        continue
+                lambda_stats = {
+                    'total': total,
+                    'home_win_rate': home_wins / total,
+                    'draw_rate': draws / total,
+                    'away_win_rate': away_wins / total,
+                    'home_win_handicap_rate': home_win_handicap / total,
+                    'over_25_rate': over_25 / total
+                }
+
+    # 计算综合推荐赔率：优先使用历史相似比赛统计，否则使用加权λ模型
+    if lambda_stats and lambda_stats['total'] >= 5:
+        p_h = lambda_stats['home_win_rate']
+        p_d = lambda_stats['draw_rate']
+        p_a = lambda_stats['away_win_rate']
+        juice = 0.9
+        odds_h = juice / p_h if p_h > 0 else 0
+        odds_d = juice / p_d if p_d > 0 else 0
+        odds_a = juice / p_a if p_a > 0 else 0
+        combined_odds = (odds_h, odds_d, odds_a)
+        combined_note = "（基于历史相似比赛统计）"
+    else:
+        # 使用加权λ模型的泊松概率计算赔率
+        def probs_and_odds(lam_h, lam_a, juice=0.9):
+            p_h = 0.0
+            p_d = 0.0
+            p_a = 0.0
+            for x in range(5):
+                for y in range(5):
+                    prob = poisson.pmf(x, lam_h) * poisson.pmf(y, lam_a)
+                    if x > y:
+                        p_h += prob
+                    elif x == y:
+                        p_d += prob
+                    else:
+                        p_a += prob
+            total = p_h + p_d + p_a
+            if total > 0:
+                p_h /= total
+                p_d /= total
+                p_a /= total
+            odds_h = juice / p_h if p_h > 0 else 0
+            odds_d = juice / p_d if p_d > 0 else 0
+            odds_a = juice / p_a if p_a > 0 else 0
+            return (p_h, p_d, p_a), (odds_h, odds_d, odds_a)
+        _, combined_odds = probs_and_odds(lam_h_combined, lam_a_combined, juice=0.9)
+        combined_note = "（加权λ模型）"
+
+    # 硬实力赔率和市场赔率仍使用泊松模型
+    def probs_and_odds_fixed(lam_h, lam_a, juice=0.9):
         p_h = 0.0
         p_d = 0.0
         p_a = 0.0
@@ -1325,34 +1398,28 @@ def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_l
         odds_a = juice / p_a if p_a > 0 else 0
         return (p_h, p_d, p_a), (odds_h, odds_d, odds_a)
 
-    _, combined_odds = probs_and_odds(lam_h_combined, lam_a_combined, juice=0.9)
-    _, strength_odds = probs_and_odds(lam_h_strength, lam_a_strength, juice=0.9)
-    _, market_odds = probs_and_odds(lam_h_market, lam_a_market, juice=0.9)
+    _, strength_odds = probs_and_odds_fixed(lam_h_strength, lam_a_strength, juice=0.9)
+    _, market_odds = probs_and_odds_fixed(lam_h_market, lam_a_market, juice=0.9)
 
     # 亚盘推荐：基于综合推荐λ差值
     diff_lam = lam_h_combined - lam_a_combined
     asian_hc = handicap_from_diff(diff_lam)
     cnt, win_rate, is_home_team = asian_handicap_stat(similar_matches, asian_hc)
     
-    # 智能调整：根据赢盘率决定推荐方向
     if cnt >= 5:
-        # 赢盘率低于40% -> 反转推荐（推荐受让方）
         if win_rate < 0.4:
-            asian_hc = -asian_hc  # 反转盘口
+            asian_hc = -asian_hc
             reversed_flag = True
         else:
             reversed_flag = False
     else:
-        reversed_flag = False  # 数据不足，不调整
+        reversed_flag = False
     
-    # 构建亚洲盘推荐文本
     if asian_hc > 0:
-        team_text = "主队"
         hc_abs = asian_hc
         hc_desc = f"主队 -{hc_abs:.2f}"
         if cnt >= 5:
             if not reversed_flag:
-                # 未反转，统计的是原方向赢盘率
                 stat_team = "主队" if is_home_team else "客队"
                 percent_text = f"，相似比赛{cnt}场，{stat_team}赢盘率 {win_rate:.0%}"
                 if win_rate < 0.4:
@@ -1360,7 +1427,6 @@ def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_l
                 elif win_rate > 0.6:
                     percent_text += "（较高）"
             else:
-                # 反转后，推荐的赢盘方是原让球方的对手，我们需要说明原让球方赢盘率低，所以推荐受让方
                 percent_text = f"，相似比赛{cnt}场，原让球方赢盘率仅 {win_rate:.0%}，因此建议关注受让方"
         elif cnt > 0:
             percent_text = f"，相似比赛仅{cnt}场，数据不足"
@@ -1371,7 +1437,6 @@ def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_l
         else:
             asian_rec = f"推荐主队受让 {hc_abs:.2f}（主队 +{hc_abs:.2f}{percent_text}）"
     elif asian_hc < 0:
-        team_text = "客队"
         hc_abs = -asian_hc
         hc_desc = f"客队 -{hc_abs:.2f}"
         if cnt >= 5:
@@ -1393,7 +1458,6 @@ def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_l
         else:
             asian_rec = f"推荐客队受让 {hc_abs:.2f}（客队 +{hc_abs:.2f}{percent_text}）"
     else:
-        # 平手盘
         if cnt >= 5:
             percent_text = f"，相似比赛{cnt}场，主队赢盘率 {win_rate:.0%}"
             if win_rate > 0.6:
@@ -1406,7 +1470,7 @@ def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_l
             percent_text = "，无相似比赛数据"
         asian_rec = f"推荐平手盘（主队 0{percent_text}）"
 
-    # 大小球推荐（使用机器学习或加权规则）
+    # 大小球推荐
     ml_ou_prob = None
     if use_ml:
         current_row = pd.Series({
@@ -1432,7 +1496,6 @@ def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_l
             final_ou = "不明确"
             ou_conf = 0
     else:
-        # 加权规则大小球
         if real_h_lam is not None and real_a_lam is not None:
             strength_ou = real_h_lam + real_a_lam
             strength_score = 1 if strength_ou > 2.8 else (-1 if strength_ou < 2.2 else 0)
@@ -1493,7 +1556,7 @@ def comprehensive_recommendation(team_h, team_a, lam_h_init, lam_a_init, lam_h_l
     pred_score = best_score
     pred_note = "（加权λ）"
 
-    return (combined_odds, strength_odds, market_odds, asian_rec, final_ou, ou_conf, pred_score, pred_note)
+    return (combined_odds, strength_odds, market_odds, asian_rec, final_ou, ou_conf, pred_score, pred_note, lambda_stats, combined_note)
 
 # ========== Streamlit 主界面 ==========
 st.set_page_config(layout="wide")
@@ -1611,7 +1674,7 @@ with tab1:
                                                   lam_h_init=lam_h_init, lam_a_init=lam_a_init)
             st.session_state['similar_for_rec'] = similar_matches
             
-            # ========== 球队近期真实实力 & 波胆对比（始终可见） ==========
+            # ========== 球队近期真实实力 & 综合推荐（始终可见） ==========
             st.markdown("## 📊 球队近期真实实力 & 综合推荐")
             st.markdown("**说明**：以下推荐基于当前解析的本场比赛波胆赔率。")
             st.info(f"**当前解析的本场比赛市场λ**：主队 {lam_h_live:.3f} | 客队 {lam_a_live:.3f}")
@@ -1637,7 +1700,7 @@ with tab1:
                         st.session_state['strength_a_raw'] = avg_raw_a
                         st.session_state['strength_a_adj'] = avg_adj_a
                         st.session_state['strength_a_details'] = details_a
-                        (combined_odds, strength_odds, market_odds, asian_rec, final_ou, ou_conf, pred_score, pred_note) = comprehensive_recommendation(
+                        (combined_odds, strength_odds, market_odds, asian_rec, final_ou, ou_conf, pred_score, pred_note, lambda_stats, combined_note) = comprehensive_recommendation(
                             team_h, team_a,
                             lam_h_init, lam_a_init,
                             lam_h_live, lam_a_live,
@@ -1656,10 +1719,11 @@ with tab1:
                         st.markdown("#### 📊 胜平负赔率（返还率90%）")
                         col_combined, col_strength, col_market = st.columns(3)
                         with col_combined:
-                            st.markdown("**综合推荐赔率**（加权λ模型）")
+                            st.markdown("**综合推荐赔率**（基于历史相似比赛统计）")
                             st.write(f"主胜: {combined_odds[0]:.2f}")
                             st.write(f"平局: {combined_odds[1]:.2f}")
                             st.write(f"客胜: {combined_odds[2]:.2f}")
+                            st.caption(combined_note)
                         with col_strength:
                             st.markdown("**硬实力赔率**（近5场调整后λ）")
                             st.write(f"主胜: {strength_odds[0]:.2f}")
@@ -1675,6 +1739,15 @@ with tab1:
                         st.markdown("#### ⚽ 大小球与比分")
                         st.write(f"大小球推荐: {final_ou} (置信度 {ou_conf:.0%})")
                         st.write(f"预测比分: {pred_score} {pred_note}")
+                        
+                        # 基于λ值的历史相似比赛共性
+                        if lambda_stats and lambda_stats['total'] >= 5:
+                            st.markdown("#### 📈 基于λ值的历史相似比赛共性（综合λ差值）")
+                            st.write(f"共匹配 {lambda_stats['total']} 场历史比赛：")
+                            st.write(f"**主胜概率**: {lambda_stats['home_win_rate']:.1%} | **平局概率**: {lambda_stats['draw_rate']:.1%} | **客胜概率**: {lambda_stats['away_win_rate']:.1%}")
+                            st.write(f"**主队赢盘率**: {lambda_stats['home_win_handicap_rate']:.1%} | **大2.5球概率**: {lambda_stats['over_25_rate']:.1%}")
+                        else:
+                            st.info("基于λ值的相似历史比赛不足5场，无法提供统计共性。")
                         
                         if avg_adj_h is not None and avg_adj_a is not None:
                             st.markdown("**📊 硬实力摘要**")
@@ -1729,7 +1802,6 @@ with tab1:
             elif real_h_lam is None or real_a_lam is None:
                 st.info("请先点击上方「生成综合推荐」按钮获取球队硬实力。")
             else:
-                # 硬实力得分：主队加成0.2，客队加成0.1
                 home_strength_score = (real_h_lam - real_a_lam) * 0.8 + 0.2
                 away_strength_score = (real_a_lam - real_h_lam) * 0.8 + 0.1
                 market_score = cur_lam_h - cur_lam_a
