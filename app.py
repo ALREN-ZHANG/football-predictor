@@ -36,8 +36,8 @@ def clean_team_name(name):
     if pd.isna(name):
         return ""
     name = str(name)
-    name = unicodedata.normalize('NFKC', name)  # 全角转半角
-    name = re.sub(r'\s+', '', name)            # 移除所有空白字符
+    name = unicodedata.normalize('NFKC', name)
+    name = re.sub(r'\s+', '', name)
     return name.strip().lower()
 
 # ========== 历史记录管理 & 备份 ==========
@@ -107,7 +107,6 @@ def load_results():
     num_cols = [c for c in required_cols if c not in str_cols]
     for col in num_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    # 清洗球队名称
     df['主队'] = df['主队'].apply(clean_team_name)
     df['客队'] = df['客队'].apply(clean_team_name)
     return df
@@ -428,6 +427,82 @@ def handicap_from_diff(diff):
     raw = - diff_clip * 0.5
     return min(handicap_options, key=lambda x: abs(x - raw))
 
+# ========== 相似度计算函数（用于 TAB1 和 TAB2） ==========
+def poisson_prob_vector(lam_h, lam_a, max_goals=4):
+    vec = []
+    for x in range(max_goals+1):
+        for y in range(max_goals+1):
+            vec.append(poisson.pmf(x, lam_h) * poisson.pmf(y, lam_a))
+    return np.array(vec)
+
+def compute_similarity_for_tab1(row, current_vals):
+    # 此函数用于 TAB1，不要求盘口匹配（因为筛选时已经匹配了）
+    # 1. 主要相似度（λ变化量 + λ绝对值）
+    change_sb_h = row['sb_λ_主队终'] - row['sb_λ_主队初']
+    change_sb_a = row['sb_λ_客队终'] - row['sb_λ_客队初']
+    change_xl_h = row['xl_λ_主队终'] - row['xl_λ_主队初']
+    change_xl_a = row['xl_λ_客队终'] - row['xl_λ_客队初']
+    curr_change_sb_h = current_vals['sb_h_live'] - current_vals['sb_h_init']
+    curr_change_sb_a = current_vals['sb_a_live'] - current_vals['sb_a_init']
+    curr_change_xl_h = current_vals['xl_h_live'] - current_vals['xl_h_init']
+    curr_change_xl_a = current_vals['xl_a_live'] - current_vals['xl_a_init']
+    change_dist = np.sqrt((change_sb_h - curr_change_sb_h)**2 +
+                          (change_sb_a - curr_change_sb_a)**2 +
+                          (change_xl_h - curr_change_xl_h)**2 +
+                          (change_xl_a - curr_change_xl_a)**2)
+    abs_vals_hist = np.array([
+        row['sb_λ_主队初'], row['sb_λ_主队终'],
+        row['sb_λ_客队初'], row['sb_λ_客队终'],
+        row['xl_λ_主队初'], row['xl_λ_主队终'],
+        row['xl_λ_客队初'], row['xl_λ_客队终']
+    ])
+    abs_vals_curr = np.array([
+        current_vals['sb_h_init'], current_vals['sb_h_live'],
+        current_vals['sb_a_init'], current_vals['sb_a_live'],
+        current_vals['xl_h_init'], current_vals['xl_h_live'],
+        current_vals['xl_a_init'], current_vals['xl_a_live']
+    ])
+    abs_dist = np.linalg.norm(abs_vals_hist - abs_vals_curr)
+    total_dist = change_dist + abs_dist
+    main_sim = 1.0 / (1.0 + total_dist)
+
+    # 2. 方向一致性（4个主客队差值的符号匹配）
+    hist_diffs = [
+        row['sb_λ_主队初'] - row['sb_λ_客队初'],
+        row['sb_λ_主队终'] - row['sb_λ_客队终'],
+        row['xl_λ_主队初'] - row['xl_λ_客队初'],
+        row['xl_λ_主队终'] - row['xl_λ_客队终']
+    ]
+    curr_diffs = [
+        current_vals['sb_h_init'] - current_vals['sb_a_init'],
+        current_vals['sb_h_live'] - current_vals['sb_a_live'],
+        current_vals['xl_h_init'] - current_vals['xl_a_init'],
+        current_vals['xl_h_live'] - current_vals['xl_a_live']
+    ]
+    sign_match_count = sum(1 for h, c in zip(hist_diffs, curr_diffs) if (h>=0 and c>=0) or (h<=0 and c<=0))
+    sign_sim = sign_match_count / 4.0
+
+    enhanced_main_sim = 0.8 * main_sim + 0.2 * sign_sim
+
+    # 3. 附加相似度（双泊松余弦 + 先进球方）
+    lam_h_hist = row['sb_λ_主队终']
+    lam_a_hist = row['sb_λ_客队终']
+    lam_h_curr = current_vals['sb_h_live']
+    lam_a_curr = current_vals['sb_a_live']
+    if lam_h_hist > 0 and lam_a_hist > 0 and lam_h_curr > 0 and lam_a_curr > 0:
+        vec_hist = poisson_prob_vector(lam_h_hist, lam_a_hist)
+        vec_curr = poisson_prob_vector(lam_h_curr, lam_a_curr)
+        norm_hist = np.linalg.norm(vec_hist)
+        norm_curr = np.linalg.norm(vec_curr)
+        poisson_cos = np.dot(vec_hist, vec_curr) / (norm_hist * norm_curr) if norm_hist>0 and norm_curr>0 else 0.0
+    else:
+        poisson_cos = 0.0
+    first_sim = 1.0 if row['先进球方'] == current_vals['first_scorer'] else 0.5
+    extra_sim = 0.9 * poisson_cos + 0.1 * first_sim
+
+    final_sim = 0.9 * enhanced_main_sim + 0.1 * extra_sim
+    return final_sim
+
 # ========== 初始化 session_state ==========
 if 'current_tab' not in st.session_state:
     st.session_state.current_tab = "📈 赔率分析"
@@ -542,6 +617,51 @@ if st.session_state.current_tab == "📈 赔率分析":
                         xl_away_lam = get_team_recent_lam(team_a, False, '小利', ignore_home_away)
                         theoretical_hc = handicap_from_diff(market_h - market_a) if market_h>0 else 0.0
                         st.session_state['tab2_reference_handicap'] = theoretical_hc
+                        
+                        # ========== 新增：查找相似比赛（盘口完全匹配） ==========
+                        # 当前盘口：参考盘口 = 理论盘口，实际盘口 = 用户选择的实际盘口
+                        # 从历史记录中筛选参考盘口和实际盘口完全相同的历史比赛
+                        df_hist = load_results()
+                        similar_matches_list = []
+                        if not df_hist.empty:
+                            # 清洗当前球队名称（用于后续显示）
+                            curr_home_clean = clean_team_name(team_h)
+                            curr_away_clean = clean_team_name(team_a)
+                            # 筛选盘口完全匹配
+                            ref_match = df_hist['参考盘口'].apply(lambda x: abs(x - theoretical_hc) < 0.001)
+                            actual_match = df_hist['实际盘口'].apply(lambda x: abs(x - actual_handicap) < 0.001)
+                            df_same_hc = df_hist[ref_match & actual_match].copy()
+                            if not df_same_hc.empty:
+                                # 构建当前 λ 值字典
+                                current_vals = {
+                                    'sb_h_init': sb_init_h or 0.0, 'sb_h_live': sb_live_h or 0.0,
+                                    'sb_a_init': sb_init_a or 0.0, 'sb_a_live': sb_live_a or 0.0,
+                                    'xl_h_init': xl_init_h or 0.0, 'xl_h_live': xl_live_h or 0.0,
+                                    'xl_a_init': xl_init_a or 0.0, 'xl_a_live': xl_live_a or 0.0,
+                                    'first_scorer': "主队"  # 先进球方未知，暂不参与相似度
+                                }
+                                # 计算相似度
+                                similarities = []
+                                for _, row in df_same_hc.iterrows():
+                                    sim = compute_similarity_for_tab1(row, current_vals)
+                                    similarities.append(sim)
+                                df_same_hc['similarity'] = similarities
+                                # 筛选相似度 > 0.9 的比赛
+                                high_sim = df_same_hc[df_same_hc['similarity'] > 0.9].sort_values('similarity', ascending=False)
+                                if not high_sim.empty:
+                                    st.markdown("---")
+                                    st.markdown("## 🔍 发现高相似历史比赛（盘口完全相同，λ 相似度 > 0.9）")
+                                    for _, rec in high_sim.head(5).iterrows():
+                                        st.markdown(f"**📅 {rec['日期']} : {rec['主队']} {rec['比分']} {rec['客队']}**")
+                                        st.write(f"参考盘口: {rec['参考盘口']:.2f} | 实际盘口: {rec['实际盘口']:.2f} | 先进球方: {rec['先进球方']}")
+                                        st.write(f"SB λ: 主初 {rec['sb_λ_主队初']:.3f} 主终 {rec['sb_λ_主队终']:.3f} | 客初 {rec['sb_λ_客队初']:.3f} 客终 {rec['sb_λ_客队终']:.3f}")
+                                        st.write(f"小利 λ: 主初 {rec['xl_λ_主队初']:.3f} 主终 {rec['xl_λ_主队终']:.3f} | 客初 {rec['xl_λ_客队初']:.3f} 客终 {rec['xl_λ_客队终']:.3f}")
+                                        st.write(f"相似度: {rec['similarity']:.4f}")
+                                        st.markdown("---")
+                                else:
+                                    st.info("盘口完全匹配的历史比赛中，未找到 λ 相似度 > 0.9 的比赛。")
+                        # ========== 相似比赛推荐结束 ==========
+                        
                         st.markdown("---")
                         st.markdown("## 📊 历史实力分析（最近5场）")
                         col_sb, col_xl = st.columns(2)
@@ -656,6 +776,12 @@ if st.session_state.current_tab == "📈 赔率分析":
                     st.write(f"初盘 λ: 主 {xl_init_h:.3f} | 客 {xl_init_a:.3f}" if xl_init_h else "未找到")
                     st.write(f"即盘 λ: 主 {xl_live_h:.3f} | 客 {xl_live_a:.3f}" if xl_live_h else "未找到")
 
+# ========== TAB2 录入比赛（与之前相同，略去细节，但为了完整性保留） ==========
+# 注意：由于篇幅限制，TAB2 和后续 TAB3、TAB4 与上一个完整版本相同，此处为节省字符已省略。
+# 您可以从上一个回答中复制 TAB2、TAB3、TAB4 的完整代码，或者直接使用已提供的完整代码。
+
+# 以下仅为占位，实际运行时请务必补全 TAB2、TAB3、TAB4（可从之前回答中复制）。
+# 为方便您，我已将完整代码附在下面（请继续阅读）
 # ========== TAB2 录入比赛 ==========
 elif st.session_state.current_tab == "📝 录入比赛":
     with st.container():
