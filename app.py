@@ -447,6 +447,51 @@ def handicap_from_diff(diff):
     raw = - diff_clip * 0.5
     return min(handicap_options, key=lambda x: abs(x - raw))
 
+# ========== 新增：基于四个 λ 终值查找最接近的历史比赛 ==========
+def find_similar_by_lambdas(current_lambdas, top_n=4):
+    """
+    根据当前四个 λ 终值（SB主、SB客、小利主、小利客）查找历史最接近的比赛
+    current_lambdas: dict 包含 'sb_h', 'sb_a', 'xl_h', 'xl_a'
+    """
+    df = load_results()
+    if df.empty:
+        return pd.DataFrame()
+    
+    # 需要的列
+    required_cols = ['sb_λ_主队终', 'sb_λ_客队终', 'xl_λ_主队终', 'xl_λ_客队终']
+    for col in required_cols:
+        if col not in df.columns:
+            return pd.DataFrame()
+    
+    # 复制并过滤掉 λ 缺失的行（任一为0或NaN）
+    df_clean = df.copy()
+    for col in required_cols:
+        df_clean = df_clean[df_clean[col].notna() & (df_clean[col] > 0)]
+    
+    if df_clean.empty:
+        return pd.DataFrame()
+    
+    # 构造当前向量
+    curr_vec = np.array([
+        current_lambdas.get('sb_h', 0.0),
+        current_lambdas.get('sb_a', 0.0),
+        current_lambdas.get('xl_h', 0.0),
+        current_lambdas.get('xl_a', 0.0)
+    ])
+    
+    # 计算欧氏距离
+    def euclidean_distance(row):
+        hist_vec = np.array([
+            row['sb_λ_主队终'], row['sb_λ_客队终'],
+            row['xl_λ_主队终'], row['xl_λ_客队终']
+        ])
+        return np.linalg.norm(hist_vec - curr_vec)
+    
+    df_clean['distance'] = df_clean.apply(euclidean_distance, axis=1)
+    df_sorted = df_clean.sort_values('distance').head(top_n)
+    return df_sorted[['日期', '主队', '客队', '比分', '先进球方', 
+                      'sb_λ_主队终', 'sb_λ_客队终', 'xl_λ_主队终', 'xl_λ_客队终', 'distance']]
+
 # ========== 相似度计算函数（用于 TAB1 和 TAB2） ==========
 def poisson_prob_vector(lam_h, lam_a, max_goals=4):
     vec = []
@@ -630,6 +675,41 @@ if st.session_state.current_tab == "📈 赔率分析":
                     st.info(f"📊 当前市场λ（{source}即盘）：主队 {market_h:.3f} | 客队 {market_a:.3f}")
                 else:
                     st.warning("未能提取到有效λ值")
+
+                # ===== 新增：基于 λ 终值的历史相近比赛推荐（独立于盘口） =====
+                st.markdown("---")
+                st.markdown("## 🔍 历史 λ 终值相近比赛推荐（独立于盘口）")
+                current_lambdas = {
+                    'sb_h': sb_live_h if sb_live_h else 0.0,
+                    'sb_a': sb_live_a if sb_live_a else 0.0,
+                    'xl_h': xl_live_h if xl_live_h else 0.0,
+                    'xl_a': xl_live_a if xl_live_a else 0.0
+                }
+                # 检查至少有一个公司的两个λ都有效
+                valid_sb = current_lambdas['sb_h'] > 0 and current_lambdas['sb_a'] > 0
+                valid_xl = current_lambdas['xl_h'] > 0 and current_lambdas['xl_a'] > 0
+                if valid_sb or valid_xl:
+                    similar_df = find_similar_by_lambdas(current_lambdas, top_n=4)
+                    if not similar_df.empty:
+                        st.success(f"找到 {len(similar_df)} 场 λ 终值最接近的历史比赛（基于SB+小利即盘λ）")
+                        for _, row in similar_df.iterrows():
+                            with st.container():
+                                col1, col2 = st.columns([1, 2])
+                                with col1:
+                                    st.markdown(f"**{row['日期']}**")
+                                    st.markdown(f"{row['主队']} {row['比分']} {row['客队']}")
+                                    st.markdown(f"先进球: **{row['先进球方']}**")
+                                with col2:
+                                    st.markdown(f"SB λ: 主 {row['sb_λ_主队终']:.3f} / 客 {row['sb_λ_客队终']:.3f}")
+                                    st.markdown(f"小利 λ: 主 {row['xl_λ_主队终']:.3f} / 客 {row['xl_λ_客队终']:.3f}")
+                                    st.caption(f"欧氏距离: {row['distance']:.4f}")
+                                st.markdown("---")
+                    else:
+                        st.info("历史数据库中暂无 λ 终值有效且相近的比赛。")
+                else:
+                    st.warning("当前解析出的 λ 终值数据不足（至少需要一家公司的完整主客 λ），无法进行相近推荐。")
+                # ===== 新增结束 =====
+
                 st.markdown("### 🏟️ 输入球队名称进行预测")
                 col_team1, col_team2 = st.columns(2)
                 with col_team1:
