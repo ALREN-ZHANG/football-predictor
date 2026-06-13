@@ -663,20 +663,23 @@ if st.session_state.current_tab == "📈 赔率分析":
                     'init_h': xl_init_h or 0.0, 'init_a': xl_init_a or 0.0,
                     'live_h': xl_live_h or 0.0, 'live_a': xl_live_a or 0.0
                 }
-                if sb_live_h is not None:
-                    market_h, market_a = sb_live_h, sb_live_a
-                    source = "SB"
-                elif xl_live_h is not None:
-                    market_h, market_a = xl_live_h, xl_live_a
-                    source = "小利"
+
+                # 显示SB和小利即盘λ
+                if sb_live_h is not None and sb_live_h > 0:
+                    st.info(f"📊 SB（沙巴）即盘λ：主队 {sb_live_h:.3f} | 客队 {sb_live_a:.3f}")
+                if xl_live_h is not None and xl_live_h > 0:
+                    st.info(f"📊 小利即盘λ：主队 {xl_live_h:.3f} | 客队 {xl_live_a:.3f}")
+                if (sb_live_h is None or sb_live_h == 0) and (xl_live_h is None or xl_live_h == 0):
+                    st.warning("未能提取到有效λ值")
+                # 为后续预测保留优先使用的市场数据（SB优先，若无效则用小利）
+                if sb_live_h is not None and sb_live_h > 0:
+                    market_h, market_a, source = sb_live_h, sb_live_a, "SB"
+                elif xl_live_h is not None and xl_live_h > 0:
+                    market_h, market_a, source = xl_live_h, xl_live_a, "小利"
                 else:
                     market_h, market_a, source = 0.0, 0.0, "无"
-                if market_h > 0:
-                    st.info(f"📊 当前市场λ（{source}即盘）：主队 {market_h:.3f} | 客队 {market_a:.3f}")
-                else:
-                    st.warning("未能提取到有效λ值")
 
-                # ===== 新增：基于 λ 终值的历史相近比赛推荐（独立于盘口） =====
+                # 基于λ终值的历史相近比赛推荐（独立于盘口）
                 st.markdown("---")
                 st.markdown("## 🔍 历史 λ 终值相近比赛推荐（独立于盘口）")
                 current_lambdas = {
@@ -685,7 +688,6 @@ if st.session_state.current_tab == "📈 赔率分析":
                     'xl_h': xl_live_h if xl_live_h else 0.0,
                     'xl_a': xl_live_a if xl_live_a else 0.0
                 }
-                # 检查至少有一个公司的两个λ都有效
                 valid_sb = current_lambdas['sb_h'] > 0 and current_lambdas['sb_a'] > 0
                 valid_xl = current_lambdas['xl_h'] > 0 and current_lambdas['xl_a'] > 0
                 if valid_sb or valid_xl:
@@ -708,7 +710,6 @@ if st.session_state.current_tab == "📈 赔率分析":
                         st.info("历史数据库中暂无 λ 终值有效且相近的比赛。")
                 else:
                     st.warning("当前解析出的 λ 终值数据不足（至少需要一家公司的完整主客 λ），无法进行相近推荐。")
-                # ===== 新增结束 =====
 
                 st.markdown("### 🏟️ 输入球队名称进行预测")
                 col_team1, col_team2 = st.columns(2)
@@ -753,10 +754,11 @@ if st.session_state.current_tab == "📈 赔率分析":
                                     sim = compute_similarity_for_tab1(row, current_vals)
                                     similarities.append(sim)
                                 df_same_hc['similarity'] = similarities
-                                high_sim = df_same_hc[df_same_hc['similarity'] > 0.9].sort_values('similarity', ascending=False)
+                                # 修改阈值：从 0.9 改为 0.85
+                                high_sim = df_same_hc[df_same_hc['similarity'] > 0.85].sort_values('similarity', ascending=False)
                                 if not high_sim.empty:
                                     st.markdown("---")
-                                    st.markdown("## 🔍 发现高相似历史比赛（盘口完全相同，λ 相似度 > 0.9）")
+                                    st.markdown("## 🔍 发现高相似历史比赛（盘口完全相同，λ 相似度 > 0.85）")
                                     for _, rec in high_sim.head(5).iterrows():
                                         st.markdown(f"**📅 {rec['日期']} : {rec['主队']} {rec['比分']} {rec['客队']}**")
                                         st.write(f"参考盘口: {rec['参考盘口']:.2f} | 实际盘口: {rec['实际盘口']:.2f} | 先进球方: {rec['先进球方']}")
@@ -765,7 +767,7 @@ if st.session_state.current_tab == "📈 赔率分析":
                                         st.write(f"相似度: {rec['similarity']:.4f}")
                                         st.markdown("---")
                                 else:
-                                    st.info("盘口完全匹配的历史比赛中，未找到 λ 相似度 > 0.9 的比赛。")
+                                    st.info("盘口完全匹配的历史比赛中，未找到 λ 相似度 > 0.85 的比赛。")
 
                         st.markdown("---")
                         st.markdown("## 📊 历史实力分析（最近5场）")
